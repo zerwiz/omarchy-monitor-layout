@@ -14,8 +14,8 @@ import "Monitors.js" as Mon
 
 Panel {
   id: root
-  moduleName: "heimdallomarchy.monitor-layout"
-  ipcTarget: "heimdallomarchy.monitor-layout"
+  moduleName: "zerwiz.monitor-layout"
+  ipcTarget: "zerwiz.monitor-layout"
   manageIpc: false
 
   // ---- theme helpers ---------------------------------------------------
@@ -48,6 +48,14 @@ Panel {
   // hyprctl does not read these four back, so without this a refresh would
   // silently reset them and the next Save would write the defaults instead.
   property var colorSticky: ({})
+  // Colour fields read from monitors.lua, so Save preserves a hand-set
+  // HDR/ICC/EOTF value instead of writing a guessed default over it.
+  property var configColor: ({})
+  // Monitor names whose colour this session has actually changed; only those
+  // are written to the config file on Save.
+  property var colorTouched: ({})
+  // Queued ddcutil setvcp requests, drained one at a time.
+  property var ddcSetQueue: ([])
   property int totalCount: 0
   property int enabledCount: 0
   property string monitorSummary: "0 of 0 on"
@@ -129,15 +137,17 @@ Panel {
   onOpenedChanged: if (root.opened) {
     cursorActive = false
     nowMs = Date.now()
-    root.refresh()
+    // Read the config first: it carries the colour fields hyprctl cannot
+    // report, and the refresh that follows seeds the model from them.
+    readConfigProc.running = true
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
   Component.onCompleted: {
-    // Refresh is scheduled first and unconditionally: DDC/CI is an optional
-    // extra, so a failure there (no binary, no i2c permission) must never stop
-    // the monitor list from loading.
-    Qt.callLater(root.refresh)
+    // The config read gates the first refresh, so a monitor's existing colour
+    // survives the panel's own list rebuild. DDC/CI is an optional extra and
+    // must never stop the monitor list from loading.
+    readConfigProc.running = true
     try {
       root.startDdc()
     } catch (e) {
@@ -182,12 +192,16 @@ Panel {
     for (var i = 0; i < arr.length; i++) {
       var m = arr[i]
       modes[m.name] = Mon.toArray(m.availableModes)
+      // Session changes win; otherwise the config file is the truth for the
+      // fields hyprctl cannot report, so a refresh never resets a hand-set
+      // colour to a guessed default.
       var stick = root.colorSticky[m.name]
+      if (!root.colorTouched[m.name] && root.configColor[m.name]) stick = root.configColor[m.name]
       if (stick) {
-        m.sdrEotf = stick.sdrEotf
-        m.supportsHdr = stick.supportsHdr
-        m.supportsWideColor = stick.supportsWideColor
-        m.icc = stick.icc
+        if (stick.sdrEotf !== undefined) m.sdrEotf = stick.sdrEotf
+        if (stick.supportsHdr !== undefined) m.supportsHdr = stick.supportsHdr
+        if (stick.supportsWideColor !== undefined) m.supportsWideColor = stick.supportsWideColor
+        if (stick.icc !== undefined) m.icc = stick.icc
       }
       sticky[m.name] = { sdrEotf: m.sdrEotf, supportsHdr: m.supportsHdr,
                         supportsWideColor: m.supportsWideColor, icc: m.icc }
@@ -330,6 +344,9 @@ Panel {
     sticky.supportsWideColor = m.supportsWideColor
     sticky.icc = m.icc
     root.colorSticky[name] = sticky
+    var touched = root.colorTouched
+    touched[name] = true
+    root.colorTouched = touched
 
     applyColor(i)
   }
@@ -420,7 +437,13 @@ Panel {
 
   function setDdc(name, field, value) {
     var n = root.ddcNumber(name)
-    if (n <= 0 || ddcSetProc.running) return
+    if (n <= 0) return
+    // ddcutil is one shared process; queue rather than drop, so "Reset to
+    // standard" can write brightness and contrast for every screen.
+    if (ddcSetProc.running) {
+      root.ddcSetQueue.push({ name: name, field: field, value: value })
+      return
+    }
     var code = field === "contrast" ? "12" : "10"
     ddcSetProc.targetName = name
     ddcSetProc.command = ["ddcutil", "-d", String(n), "setvcp", code, String(Math.round(value))]
@@ -428,6 +451,52 @@ Panel {
     // Optimistic update so the slider does not snap back while ddcutil runs.
     var i = root.monitorIndexOf(name)
     if (i >= 0) monitorModel.setProperty(i, "ddc" + field.charAt(0).toUpperCase() + field.slice(1), Math.round(value))
+  }
+
+  // ---- reset to standard ------------------------------------------------
+  // Two pipelines, two persistence models. Colour lives in monitors.lua, so a
+  // reset is a live rule plus a Save (which reloads, and also drops any ICC
+  // profile, because hl.monitor cannot unset an icc path). Hardware lives in
+  // the monitor's own firmware, so resetting it is a ddcutil write.
+  function resetColorStandard() {
+    var arr = root.currentMonitors()
+    var lines = []
+    var touched = root.colorTouched
+    var sticky = root.colorSticky
+    for (var i = 0; i < arr.length; i++) {
+      if (!arr[i].name) continue
+      writeRow(i, Mon.standardColor())
+      touched[arr[i].name] = true
+      sticky[arr[i].name] = { sdrEotf: "default", supportsHdr: 0, supportsWideColor: 0, icc: "" }
+      if (!arr[i].disabled) lines.push(Mon.standardColorLuaFor(arr[i].name))
+    }
+    root.colorTouched = touched
+    root.colorSticky = sticky
+    if (lines.length > 0 && !applyProc.running) {
+      applyProc.command = ["hyprctl", "eval", lines.join("\n")]
+      root.applying = true
+      applyProc.running = true
+    }
+    root.pendingStatus = "Colour reset to standard"
+    root.saveConfig()
+  }
+
+  function resetDdcStandard() {
+    var arr = root.currentMonitors()
+    var n = 0
+    for (var i = 0; i < arr.length; i++) {
+      if (!root.ddcSupports(arr[i].name)) continue
+      root.setDdc(arr[i].name, "brightness", Mon.DDC_STANDARD.brightness)
+      root.setDdc(arr[i].name, "contrast", Mon.DDC_STANDARD.contrast)
+      n++
+    }
+    if (n > 0) root.status = "Hardware brightness/contrast reset to standard"
+  }
+
+  function colorOf(m) {
+    return { cm: m.cm, sdrEotf: m.sdrEotf, sdrBrightness: m.sdrBrightness,
+             sdrSaturation: m.sdrSaturation, bitdepth: m.bitdepth,
+             supportsHdr: m.supportsHdr, supportsWideColor: m.supportsWideColor, icc: m.icc }
   }
 
   // ---- arrangements ----------------------------------------------------
@@ -540,7 +609,9 @@ Panel {
   // Hyprland 0.56 dropped the legacy parser, so `hyprctl keyword` is rejected;
   // runtime changes go through `hyprctl eval` with the config's Lua syntax.
   function applyOne(index) {
-    if (applyProc.running) return
+    // Queue instead of dropping: a drag or a dropdown change made during an
+    // in-flight apply must still land.
+    if (applyProc.running) { root.applyQueued = true; return }
     var lua = Mon.monitorLuaFor(root.currentMonitors()[index])
     if (!lua) return
     applyProc.command = ["hyprctl", "eval", lua]
@@ -568,9 +639,18 @@ Panel {
     for (var i = 0; i < fixed.list.length; i++) {
       writeRow(i, { x: fixed.list[i].x, y: fixed.list[i].y })
     }
+    // Only monitors whose colour this session changed (or that the file
+    // already carried colour for) are written with colour fields. Everything
+    // else saves geometry only, so a Save cannot overwrite colour with a
+    // default the panel never confirmed.
+    var colorMap = {}
+    for (var c = 0; c < fixed.list.length; c++) {
+      var nm = fixed.list[c].name
+      if (root.colorTouched[nm] || root.configColor[nm]) colorMap[nm] = root.colorOf(fixed.list[c])
+    }
     root.saving = true
     root.status = fixed.changed ? "Fixed an overlapping layout, saving…" : "Saving layout…"
-    saveWriteProc.command = ["python3", "-c", root.writeHelper, root.configPath, Mon.luaFor(fixed.list)]
+    saveWriteProc.command = ["python3", "-c", root.writeHelper, root.configPath, Mon.luaFor(fixed.list, colorMap)]
     saveWriteProc.running = true
   }
 
@@ -730,6 +810,22 @@ Panel {
     }
   }
 
+  // The colour fields hyprctl cannot report live in the config file; read it
+  // once so the panel's model starts from the truth, not from guessed defaults.
+  Process {
+    id: readConfigProc
+    running: false
+    command: ["cat", root.configPath]
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.configColor = Mon.parseConfigColor(text)
+        root.refresh()
+      }
+    }
+  }
+
   Process {
     id: applyProc
     running: false
@@ -835,6 +931,11 @@ Panel {
       if (code !== 0) root.status = "Monitor rejected the value (ddcutil exit " + code + ")"
       // Read back so the slider shows the value the monitor actually stored.
       if (ddcSetProc.targetName) root.readDdc(ddcSetProc.targetName)
+      if (root.ddcSetQueue.length > 0) {
+        var next = root.ddcSetQueue.shift()
+        root.ddcSetQueue = root.ddcSetQueue
+        root.setDdc(next.name, next.field, next.value)
+      }
     }
   }
 
@@ -940,6 +1041,7 @@ Panel {
       anchors.fill: parent
 
       onMoveRequested: function(dx, dy) {
+        if (resetConfirm.opened) return
         if (dx !== 0 || dy !== 0) {
           root.cursorActive = true
           if (root.selectedIndex < 0) {
@@ -950,13 +1052,16 @@ Panel {
         }
       }
       onActivateRequested: {
+        if (resetConfirm.opened) { resetConfirm.confirmed(); return }
         if (root.selectedIndex < 0) return
         if (root.sel && root.sel.disabled) root.setEnabled(root.sel.name, true)
         else if (root.sel) root.makeMain(root.sel.name)
       }
-      onCloseRequested: root.close()
-      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onCloseRequested: if (resetConfirm.opened) resetConfirm.canceled()
+                        else root.close()
+      onTabRequested: function(direction) { if (!resetConfirm.opened) root.switchPanel(direction) }
       onTextKey: function(t) {
+        if (resetConfirm.opened) return
         if (t === "a" || t === "A") root.applyAll()
         else if (t === "s" || t === "S") root.saveConfig()
         else if (t === "r" || t === "R") root.refresh()
@@ -1267,10 +1372,15 @@ Panel {
                 PanelSlider {
                   id: ddcBrightnessSlider
                   width: parent.width
-                  minimum: 0
+                  // Floor the slider: 0 is a black screen on a lone monitor, and
+                  // DDC state survives a reboot. A failed readback disables the
+                  // control rather than presenting a false 100%.
+                  minimum: 5
                   maximum: 100
                   step: 1
-                  value: root.sel && root.sel.ddcBrightness >= 0 ? root.sel.ddcBrightness : 100
+                  enabled: root.sel !== null && root.sel.ddcBrightness >= 0
+                  opacity: enabled ? 1.0 : 0.5
+                  value: root.sel && root.sel.ddcBrightness >= 0 ? root.sel.ddcBrightness : 50
                   // Commit on release: a ddcutil call per drag step would be
                   // far too chatty over I2C.
                   onReleased: function(v) {
@@ -1310,9 +1420,13 @@ Panel {
                 PanelSlider {
                   id: ddcContrastSlider
                   width: parent.width
-                  minimum: 0
+                  // Same floor as brightness: a failed readback disables the
+                  // control instead of offering a false value.
+                  minimum: 5
                   maximum: 100
                   step: 1
+                  enabled: root.sel !== null && root.sel.ddcContrast >= 0
+                  opacity: enabled ? 1.0 : 0.5
                   value: root.sel && root.sel.ddcContrast >= 0 ? root.sel.ddcContrast : 50
                   onReleased: function(v) {
                     if (root.sel) root.setDdc(root.sel.name, "contrast", v)
@@ -1646,6 +1760,43 @@ Panel {
           color: root.dim
           wrapMode: Text.WordWrap
         }
+
+        Button {
+          width: parent.width
+          text: "Reset to standard"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.bodySmall
+          onClicked: resetConfirm.opened = true
+        }
+
+        Text {
+          width: parent.width
+          text: "Restores Hyprland's neutral colour (sRGB, default gamma, 8 bpc, no ICC) on every screen, and sets hardware brightness and contrast to 50% where the monitor answers DDC/CI."
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          color: root.dim
+          wrapMode: Text.WordWrap
+        }
+      }
+
+      ConfirmDialog {
+        id: resetConfirm
+        anchors.fill: parent
+        z: 10
+        opened: false
+        message: "Reset colour and hardware brightness/contrast on all screens to standard?"
+        cancelText: "Cancel"
+        confirmText: "Reset"
+        background: root.surface
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onConfirmed: {
+          resetConfirm.opened = false
+          root.resetColorStandard()
+          root.resetDdcStandard()
+        }
+        onCanceled: resetConfirm.opened = false
       }
     }
   }

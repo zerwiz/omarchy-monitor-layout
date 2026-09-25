@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "zerwiz.monitor-layout",
   "name": "Display layout",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "zerwiz",
   "license": "MIT",
   "description": "Arrange monitors (position, mode, scale, rotation, enabled, main screen) from a drag-and-drop panel, like the Ubuntu Displays settings, save the layout to Hyprland's monitors.lua, and adjust monitor colour and hardware brightness/contrast.",

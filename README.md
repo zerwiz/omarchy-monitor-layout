@@ -1,4 +1,4 @@
-# Display layout — `heimdallomarchy.monitor-layout`
+# Display layout — `zerwiz.monitor-layout`
 
 An Omarchy bar-widget plugin that arranges monitors like the Ubuntu/GNOME
 **Displays** settings panel: drag screens on a canvas with magnetic edge
@@ -12,10 +12,10 @@ overlap to Hyprland's `monitors.lua`.
 └────────────────────────────────────────────────────┘
 ```
 
-- **Plugin id:** `heimdallomarchy.monitor-layout`
-- **Version:** 1.1.0 · **Kind:** `bar-widget` · **Entry:** `Panel.qml`
-- **IPC target:** `heimdallomarchy.monitor-layout`
-- **Install path:** `~/.config/omarchy/plugins/heimdallomarchy.monitor-layout/`
+- **Plugin id:** `zerwiz.monitor-layout`
+- **Version:** 1.2.0 · **Kind:** `bar-widget` · **Entry:** `Panel.qml`
+- **IPC target:** `zerwiz.monitor-layout`
+- **Install path:** `~/.config/omarchy/plugins/zerwiz.monitor-layout/`
 - **Config target:** `~/.config/hypr/monitors.lua` (backup: `monitors.lua.backup`)
 
 ## Features
@@ -41,6 +41,13 @@ overlap to Hyprland's `monitors.lua`.
   flags, plus SDR brightness/saturation. See *Limitations* — on several
   Hyprland versions the SDR fields are stored and read back but have no
   visible effect.
+- **Reset to standard** — one button restores Hyprland's neutral colour
+  (`cm = srgb`, default transfer function, SDR brightness/saturation 1, 8 bpc,
+  no ICC) on every screen and sets DDC/CI hardware brightness and contrast to
+  50% where the monitor answers. It confirms first. The colour half is saved
+  and reloaded; the hardware half writes to the monitor's own firmware (it is
+  the *only* way to undo a stray brightness/contrast change, since those are
+  not in `monitors.lua`).
 - Keyboard-navigable panel (arrow keys, `a`/`s`/`r`/`c`, Enter, Esc, Tab).
 - **Save can never write an overlapping or negative-position layout.**
 
@@ -144,10 +151,10 @@ screen (`output`, `mode`, `position`, `scale`, optional `transform`; or
 ### IPC
 
 ```
-omarchy-shell heimdallomarchy.monitor-layout open|close|toggle|show|hide
-omarchy-shell heimdallomarchy.monitor-layout refresh   # re-query hyprctl
-omarchy-shell heimdallomarchy.monitor-layout save      # write config
-omarchy-shell heimdallomarchy.monitor-layout dump      # JSON of current model (debug)
+omarchy-shell zerwiz.monitor-layout open|close|toggle|show|hide
+omarchy-shell zerwiz.monitor-layout refresh   # re-query hyprctl
+omarchy-shell zerwiz.monitor-layout save      # write config
+omarchy-shell zerwiz.monitor-layout dump      # JSON of current model (debug)
 ```
 
 ## Development notes & gotchas
@@ -213,7 +220,7 @@ ddcutil -d 1 getvcp 10 # brightness of display 1
 omarchy-shell shell listPlugins | grep monitor-layout
 
 # Does the panel respond?
-omarchy-shell heimdallomarchy.monitor-layout refresh
+omarchy-shell zerwiz.monitor-layout refresh
 
 # What is the live layout vs the saved file?
 hyprctl -j monitors | python3 -m json.tool
