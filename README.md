@@ -13,7 +13,7 @@ overlap to Hyprland's `monitors.lua`.
 ```
 
 - **Plugin id:** `heimdallomarchy.monitor-layout`
-- **Version:** 1.0.0 · **Kind:** `bar-widget` · **Entry:** `Panel.qml`
+- **Version:** 1.1.0 · **Kind:** `bar-widget` · **Entry:** `Panel.qml`
 - **IPC target:** `heimdallomarchy.monitor-layout`
 - **Install path:** `~/.config/omarchy/plugins/heimdallomarchy.monitor-layout/`
 - **Config target:** `~/.config/hypr/monitors.lua` (backup: `monitors.lua.backup`)
@@ -31,6 +31,16 @@ overlap to Hyprland's `monitors.lua`.
   screen**, **Center**.
 - **Apply layout** (live via `hyprctl keyword monitor`) and **Save to config**
   (writes `monitors.lua`, reloads, verifies, and rolls back on error).
+- **Hardware brightness and contrast** per screen, sent over **DDC/CI** with
+  `ddcutil` (VCP `0x10` / `0x12`). The panel reads the monitor's current
+  values on open and on every refresh, so a change made with the monitor's
+  own buttons is picked up. If `ddcutil` or the i2c device is unavailable,
+  the section is simply hidden and the rest of the panel keeps working.
+- **Colour controls** for the Hyprland colour pipeline: colour-management
+  preset, bit depth, transfer function, ICC profile, HDR and wide-gamut
+  flags, plus SDR brightness/saturation. See *Limitations* — on several
+  Hyprland versions the SDR fields are stored and read back but have no
+  visible effect.
 - Keyboard-navigable panel (arrow keys, `a`/`s`/`r`/`c`, Enter, Esc, Tab).
 - **Save can never write an overlapping or negative-position layout.**
 
@@ -43,6 +53,8 @@ overlap to Hyprland's `monitors.lua`.
    - Or pick **Arrange → Side by side / (main first) / Stack vertically**.
    - Select a screen and set Resolution / Scale / Rotation / Enabled, or
      **Make main screen** / **Center**.
+   - Or set **Brightness / Contrast** for the selected screen (needs
+     `ddcutil`; the section hides itself when no DDC/CI is detected).
 3. **Apply layout** to push positions live.
 4. **Save to config** to persist to `~/.config/hypr/monitors.lua`.
 
@@ -159,6 +171,41 @@ omarchy-shell heimdallomarchy.monitor-layout dump      # JSON of current model (
 - **Don't reassign the model array** to update a screen — use `setProperty`,
   otherwise delegates are recreated and snap animations are lost.
 
+## Requirements
+
+- Omarchy with Hyprland, and `hyprctl` on `PATH`.
+- **Optional:** `ddcutil` for the hardware brightness/contrast controls.
+  Without it (or without access to the i2c device) the panel still loads and
+  works; only the DDC section is hidden.
+
+```sh
+pacman -S ddcutil
+ddcutil detect          # should list your displays
+ddcutil -d 1 getvcp 10 # brightness of display 1
+```
+
+## Limitations
+
+- **Hyprland's SDR brightness and saturation are often inert.** Hyprland
+  accepts, stores and reports back `sdrBrightness` and `sdrSaturation`, but on
+  several setups (verified on Hyprland 0.56) changing them produces no visible
+  change. That is why hardware brightness/contrast go through `ddcutil` instead.
+  The compositor fields are still exposed, clearly labelled, because they do
+  work on some configurations.
+- **A screenshot cannot show a DDC brightness change.** The monitor scales the
+  framebuffer in its own scaler, after the compositor has handed it over, so
+  `grim` captures identical pixels at any brightness. Verify by eye, not with a
+  screen capture.
+- **DDC is monitor-specific.** Some panels implement only a subset of VCP
+  codes, and a few ignore brightness entirely. A monitor that does not answer
+  `getvcp 10 12` simply will not show the DDC section.
+- **DDC values live in the monitor's firmware,** not in `monitors.lua`, so they
+  are not written by *Save to config* and are not restored by `hyprctl reload`.
+- Hyprland does not report `sdr_eotf`, HDR, wide-gamut or ICC state back from
+  `hyprctl monitors`. Those fields are remembered in the plugin so saving does
+  not silently drop them, but their current value cannot be read back from the
+  compositor.
+
 ## Troubleshooting
 
 ```sh
@@ -173,6 +220,18 @@ hyprctl -j monitors | python3 -m json.tool
 hyprctl configerrors
 cat ~/.config/hypr/monitors.lua
 ```
+
+If the brightness/contrast sliders are missing, the plugin could not find a
+DDC/CI display:
+
+```sh
+ddcutil detect                 # does it list both monitors?
+ls -l /dev/i2c-*               # does the user have access?
+id -nG | tr ' ' '\n' | grep i2c
+```
+
+Brightness/contrast need access to the i2c device, which on Arch is the
+`i2c` group.
 
 If a saved layout is bad, restore the previous file:
 

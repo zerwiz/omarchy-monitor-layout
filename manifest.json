@@ -2,20 +2,29 @@
   "schemaVersion": 1,
   "id": "zerwiz.monitor-layout",
   "name": "Display layout",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "zerwiz",
   "license": "MIT",
-  "description": "Arrange monitors (position, mode, scale, rotation, enabled, main screen) from a drag-and-drop panel, like the Ubuntu Displays settings, and save the layout to Hyprland's monitors.lua.",
-  "kinds": ["bar-widget"],
+  "description": "Arrange monitors (position, mode, scale, rotation, enabled, main screen) from a drag-and-drop panel, like the Ubuntu Displays settings, save the layout to Hyprland's monitors.lua, and adjust monitor colour and hardware brightness/contrast.",
+  "kinds": [
+    "bar-widget"
+  ],
   "activation": "on-demand",
   "entryPoints": {
     "barWidget": "Panel.qml"
   },
   "barWidget": {
     "displayName": "Display layout",
-    "description": "One bar icon and one panel: drag monitors to reposition with edge snapping, pick resolution/scale/rotation, choose the main screen, and save the layout.",
+    "description": "One bar icon and one panel: drag monitors to reposition with edge snapping, pick resolution/scale/rotation, choose the main screen, set hardware brightness/contrast over DDC/CI, adjust the Hyprland colour pipeline, and save the layout.",
     "category": "Customization",
-    "aliases": ["display", "monitors", "monitor-layout"],
+    "aliases": [
+      "display",
+      "monitors",
+      "monitor-layout",
+      "brightness",
+      "contrast",
+      "ddc"
+    ],
     "allowMultiple": false,
     "defaults": {}
   }
