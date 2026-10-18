@@ -14,8 +14,8 @@ import "Monitors.js" as Mon
 
 Panel {
   id: root
-  moduleName: "heimdallomarchy.monitor-layout"
-  ipcTarget: "heimdallomarchy.monitor-layout"
+  moduleName: "zerwiz.monitor-layout"
+  ipcTarget: "zerwiz.monitor-layout"
   manageIpc: false
 
   // ---- theme helpers ---------------------------------------------------
