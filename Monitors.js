@@ -11,6 +11,37 @@ function toArray(val) {
   return out
 }
 
+// Colour handling presets Hyprland's `cm` field accepts.
+var CM_PRESETS = ["auto", "srgb", "dcip3", "dp3", "adobe", "wide", "edid", "hdr", "hdredid"]
+
+// `sdr_eotf` picks the SDR transfer function, which is the closest thing
+// Hyprland has to a gamma control.
+var EOTF_PRESETS = ["default", "gamma22", "srgb"]
+
+// Hyprland states bit depth in the packed format name: "XBGR2101010" is 10bpc.
+function bitdepthOf(format) {
+  return /2101010/.test(String(format || "")) ? 10 : 8
+}
+
+function positiveFloat(value, fallback) {
+  var n = Number(value)
+  return isFinite(n) && n > 0 ? n : fallback
+}
+
+function round3(n) {
+  return Math.round(Number(n) * 1000) / 1000
+}
+
+// Quote a value for Hyprland's Lua config. Output names, modes, ICC paths and
+// preset names all arrive from outside the panel, so a stray quote or newline
+// must not be able to break the generated rule.
+function luaString(s) {
+  return "\"" + String(s === null || s === undefined ? "" : s)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, "\\\"")
+    .replace(/[\r\n]+/g, " ") + "\""
+}
+
 function clone(monitor) {
   return {
     name: monitor.name,
@@ -24,7 +55,15 @@ function clone(monitor) {
     logicalH: monitor.logicalH,
     disabled: monitor.disabled,
     focused: monitor.focused,
-    availableModes: toArray(monitor.availableModes)
+    availableModes: toArray(monitor.availableModes),
+    cm: String(monitor.cm || "srgb"),
+    sdrBrightness: positiveFloat(monitor.sdrBrightness, 1),
+    sdrSaturation: positiveFloat(monitor.sdrSaturation, 1),
+    bitdepth: monitor.bitdepth === 10 ? 10 : 8,
+    sdrEotf: String(monitor.sdrEotf || "default"),
+    supportsHdr: Number(monitor.supportsHdr) || 0,
+    supportsWideColor: Number(monitor.supportsWideColor) || 0,
+    icc: String(monitor.icc || "")
   }
 }
 
@@ -104,7 +143,17 @@ function parse(raw) {
       logicalH: logicalH,
       disabled: !!m.disabled,
       focused: !!m.focused,
-      availableModes: modes
+      availableModes: modes,
+      // hyprctl reports these four; the rest are panel-side only (see
+      // Panel.qml colorSticky) because hyprctl does not read them back.
+      cm: String(m.colorManagementPreset || "srgb"),
+      sdrBrightness: positiveFloat(m.sdrBrightness, 1),
+      sdrSaturation: positiveFloat(m.sdrSaturation, 1),
+      bitdepth: bitdepthOf(m.currentFormat),
+      sdrEotf: "default",
+      supportsHdr: 0,
+      supportsWideColor: 0,
+      icc: ""
     })
   }
   return out
@@ -418,7 +467,7 @@ function ratesFor(modes, res) {
 // >= 0 quadrant, so a saved monitor rule is always sane for the compositor.
 function sanitize(monitors) {
   var list = monitors.map(function(m) { return clone(m) })
-  if (list.length < 2) return list
+  if (list.length < 2) return { list: list, changed: false }
 
   var changed = false
   // A few passes untangle chains of overlapping screens.
@@ -443,20 +492,162 @@ function sanitize(monitors) {
   return { list: list, changed: changed }
 }
 
-// One `hl.monitor({...})` line for a single monitor, shared by the config
-// writer and the live-apply path.
-function monitorLuaFor(m) {
-  if (m.disabled) return "hl.monitor({ output = \"" + m.name + "\", disabled = true })"
-  var parts = []
-  parts.push("output = \"" + m.name + "\"")
-  parts.push("mode = \"" + m.mode + "\"")
-  parts.push("position = \"" + Math.round(m.x) + "x" + Math.round(m.y) + "\"")
-  parts.push("scale = " + m.scale)
+// Every colour field is written out explicitly, defaults included: hl.monitor
+// is cumulative, so an omitted field keeps its previous value instead of
+// falling back to the default. Writing the defaults is what lets a slider be
+// returned to normal and actually take effect. `hyprctl reload` (which Save
+// performs) resets anything the config file does not mention.
+//
+// `icc` is the exception: Hyprland rejects an empty path, so it is only
+// written when set. Clearing a profile means saving without it and reloading.
+function colorFieldsFor(m) {
+  var parts = [
+    "cm = " + luaString(m.cm || "srgb"),
+    "sdr_eotf = " + luaString(m.sdrEotf || "default"),
+    "sdrbrightness = " + round3(positiveFloat(m.sdrBrightness, 1)),
+    "sdrsaturation = " + round3(positiveFloat(m.sdrSaturation, 1)),
+    "bitdepth = " + (m.bitdepth === 10 ? 10 : 8),
+    "supports_hdr = " + (Number(m.supportsHdr) || 0),
+    "supports_wide_color = " + (Number(m.supportsWideColor) || 0)
+  ]
+  var icc = String(m.icc || "")
+  if (icc !== "") parts.push("icc = " + luaString(icc))
+  return parts
+}
+
+// One `hl.monitor({...})` line for a single monitor. Colour is opt-in: the
+// geometry paths (apply-one / apply-layout) must never carry colour fields, or
+// moving a screen would overwrite HDR, bit depth and the ICC profile with
+// values the panel only guessed. Colour is written only when a colour object
+// is supplied, and only ever by Save and the colour controls.
+function monitorLuaFor(m, color) {
+  if (m.disabled) return "hl.monitor({ output = " + luaString(m.name) + ", disabled = true })"
+  var parts = ["output = " + luaString(m.name), "mode = " + luaString(m.mode),
+    "position = \"" + Math.round(m.x) + "x" + Math.round(m.y) + "\"",
+    "scale = " + m.scale]
   if (m.transform % 4 !== 0) parts.push("transform = " + (m.transform % 4))
+  if (color) {
+    var c = colorFieldsFor(color)
+    for (var i = 0; i < c.length; i++) parts.push(c[i])
+  }
   return "hl.monitor({ " + parts.join(", ") + " })"
 }
 
-function luaFor(monitors) {
+// Colour-only rule, so nudging a colour control does not also re-apply
+// geometry (and vice versa).
+function colorLuaFor(m) {
+  if (!m) return ""
+  if (m.disabled) return "hl.monitor({ output = " + luaString(m.name) + ", disabled = true })"
+  return "hl.monitor({ output = " + luaString(m.name) + ", " + colorFieldsFor(m).join(", ") + " })"
+}
+
+// ---- reset to standard ---------------------------------------------------
+// The neutral Hyprland colour state. "Reset to standard" restores this, so an
+// experiment with the colour controls can always be undone without
+// hand-editing monitors.lua. Values are Hyprland's own defaults.
+function standardColor() {
+  return {
+    cm: "srgb",
+    sdrEotf: "default",
+    sdrBrightness: 1,
+    sdrSaturation: 1,
+    bitdepth: 8,
+    supportsHdr: 0,          // 0 = Auto
+    supportsWideColor: 0,    // 0 = Auto
+    icc: ""
+  }
+}
+
+function standardColorLuaFor(name) {
+  return "hl.monitor({ output = " + luaString(name) + ", " + colorFieldsFor(standardColor()).join(", ") + " })"
+}
+
+// Hardware standard for DDC/CI. Deliberately NOT VCP 0x04 (Restore Factory
+// Defaults): that also wipes input source, gamma and colour temperature. 50/50
+// is mid-scale, visible and trivially recoverable.
+var DDC_STANDARD = { brightness: 50, contrast: 50 }
+
+// Read the colour fields out of an existing monitors.lua, so a panel that has
+// not been told about a monitor's colour does not overwrite what the file
+// already says. Hyprland reports cm / sdrBrightness / sdrSaturation / bitdepth
+// back from hyprctl, but not sdr_eotf, HDR, wide-colour or ICC; those four can
+// only come from the file. Only outputs that actually carry a colour field are
+// returned, so a geometry-only line is left alone.
+function parseConfigColor(raw) {
+  var out = {}
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i]
+    if (line.indexOf("hl.monitor") < 0) continue
+    var om = line.match(/output\s*=\s*"([^"]*)"/)
+    if (!om || om[1] === "") continue
+    var c = {}
+    var v
+    if ((v = line.match(/cm\s*=\s*"([^"]*)"/))) c.cm = v[1]
+    if ((v = line.match(/sdr_eotf\s*=\s*"([^"]*)"/))) c.sdrEotf = v[1]
+    if ((v = line.match(/sdrbrightness\s*=\s*([0-9.]+)/))) c.sdrBrightness = Number(v[1])
+    if ((v = line.match(/sdrsaturation\s*=\s*([0-9.]+)/))) c.sdrSaturation = Number(v[1])
+    if ((v = line.match(/bitdepth\s*=\s*([0-9]+)/))) c.bitdepth = parseInt(v[1], 10)
+    if ((v = line.match(/supports_hdr\s*=\s*(-?[0-9]+)/))) c.supportsHdr = parseInt(v[1], 10)
+    if ((v = line.match(/supports_wide_color\s*=\s*(-?[0-9]+)/))) c.supportsWideColor = parseInt(v[1], 10)
+    if ((v = line.match(/icc\s*=\s*"([^"]*)"/))) c.icc = v[1]
+    if (Object.keys(c).length > 0) out[om[1]] = c
+  }
+  return out
+}
+
+// DDC/CI (VCP) support. Hyprland's own sdrbrightness/sdrsaturation/sdr_eotf are
+// accepted and read back but do not change the rendered image on every
+// machine, so real brightness and contrast go through the monitor itself.
+
+// `ddcutil detect` groups monitors under a "Display N" heading and names the
+// DRM connector each is wired to, e.g. "DRM_connector: card1-DP-1". That
+// connector is what Hyprland calls the output, which is how the two are mapped
+// together. The card part ("card1-") is not stable across boots, so only the
+// connector is kept.
+function parseDdcDetect(raw) {
+  var displays = {}
+  var current = null
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var heading = lines[i].match(/^Display\s+(\d+)/)
+    if (heading) {
+      current = parseInt(heading[1], 10)
+      continue
+    }
+    if (current === null) continue
+    var connector = lines[i].match(/DRM_connector:\s+\S*?-([A-Za-z0-9_-]+)/)
+    if (connector) {
+      displays[connector[1]] = current
+      current = null
+    }
+  }
+  return displays
+}
+
+// "VCP code 0x10 (Brightness ): current value =  100, max value = 100"
+// Only the two features the panel uses are lifted out by name; anything else is
+// ignored so a monitor with a richer feature set cannot confuse the lookup.
+var DDC_FEATURES = { 16: "brightness", 18: "contrast" }
+
+function parseDdcValues(raw) {
+  var out = {}
+  var re = /VCP code 0x([0-9a-fA-F]+)[^:]*:\s*current value =\s*(\d+)/g
+  var m
+  while ((m = re.exec(String(raw || ""))) !== null) {
+    var name = DDC_FEATURES[parseInt(m[1], 16)]
+    if (name) out[name] = parseInt(m[2], 10)
+  }
+  return out
+}
+
+function ddcValueFor(ddc, field) {
+  if (!ddc) return -1
+  var v = ddc[field]
+  return typeof v === "number" && v >= 0 ? v : -1
+}
+
+function luaFor(monitors, colorMap) {
   var L = []
   L.push("-- Generated by the Display layout panel: Monitors layout.")
   L.push("-- Edit by hand if you like; the panel overwrites this file on Save.")
@@ -468,7 +659,11 @@ function luaFor(monitors) {
   L.push("hl.monitor({ output = \"\", mode = \"preferred\", position = \"auto\", scale = omarchy_monitor_scale })")
   L.push("")
 
-  for (var i = 0; i < monitors.length; i++) L.push(monitorLuaFor(monitors[i]))
+  for (var i = 0; i < monitors.length; i++) {
+    var name = monitors[i].name
+    var color = (colorMap && colorMap[name]) ? colorMap[name] : null
+    L.push(monitorLuaFor(monitors[i], color))
+  }
   L.push("")
   return L.join("\n")
 }
